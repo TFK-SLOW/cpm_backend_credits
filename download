@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+cpm_tokens.db
+cpm_tokens.db-journal
+.env
+.venv/
+venv/

@@ -1,0 +1,4 @@
+aiohttp>=3.9,<4
+brotli>=1.1,<2
+pycryptodome>=3.20,<4
+requests>=2.31,<3
