@@ -1812,6 +1812,81 @@ def cpm1_clone_car(token_target, car_data, target_uid, token_source=None):
     return False
 
 
+def cpm1_get_injection_slot(token):
+    """Choose an empty garage slot, falling back to the first returned slot."""
+    for _ in range(5):
+        try:
+            status, text = cpm1_api(token, "WSGetCarListV3", 20)
+            if status == 200:
+                data = json.loads(text)
+                result = data.get("result")
+                if isinstance(result, str):
+                    result = json.loads(result)
+                if isinstance(result, list):
+                    slots = [slot for slot in result if isinstance(slot, dict)]
+                    if slots:
+                        return next((slot for slot in slots if slot.get("carID", 0) == 0), slots[0])
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return None
+
+
+def cpm1_inject_car_from_source(source_token, target_token, target_uid, requested_car_id):
+    """Inject one requested model using the highest-ID source car as its template.
+
+    The source car's native appearance and tuning fields stay intact. Only the
+    model ID and, when present, the matching vinyl model ID are changed.
+    """
+    source_cars = cpm1_get_cars(source_token) or []
+    source_cars = [car for car in source_cars if isinstance(car, dict)]
+    if not source_cars:
+        return {"ok": False, "message": "SOURCE_CARS_UNAVAILABLE"}
+
+    def source_car_id(car):
+        try:
+            return int(car.get("CarID", car.get("carID", 0)) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    car = deepcopy(max(source_cars, key=source_car_id))
+    car["CarID"] = int(requested_car_id)
+    if isinstance(car.get("Vynils"), dict):
+        car["Vynils"]["CarID"] = int(requested_car_id)
+
+    slot = cpm1_get_injection_slot(target_token)
+    if not slot:
+        return {"ok": False, "message": "TARGET_GARAGE_SLOT_UNAVAILABLE"}
+
+    vinyl = car.get("Vynils") if isinstance(car.get("Vynils"), dict) else {"CarID": int(requested_car_id)}
+    payload = {
+        "ownerID": slot.get("ownerID", ""),
+        "ownerName": slot.get("ownerName", ""),
+        "description": slot.get("description", ""),
+        "CarID": slot.get("carID", 0),
+        "carGeneratedID": slot.get("carGeneratedID", ""),
+        "ownerAccountID": slot.get("ownerAccountID", ""),
+        "oneCar": car,
+        "vynilOneCar": vinyl,
+        "loadedLocalCar": {"instanceID": _rnd_cars.randint(-999999, -100000)},
+        "price": slot.get("price", 100),
+        "SellingCar": {},
+        "willReject": False,
+        "dislike": 1,
+        "like": 0,
+        "liked": False,
+        "disliked": False,
+        "mode": 1,
+    }
+    status, text = cpm1_api(target_token, "WSPurchaseCarV3", json.dumps(payload))
+    try:
+        accepted = status == 200 and str(json.loads(text).get("result")) == "1"
+    except (ValueError, TypeError, AttributeError):
+        accepted = False
+    if not accepted:
+        return {"ok": False, "message": "CAR_INJECTION_FAILED"}
+    return {"ok": True, "message": "CUSTOM_CAR_INJECTED", "car_id": int(requested_car_id)}
+
 def _car_key(car):
     if not isinstance(car, dict):
         return None
@@ -1931,6 +2006,7 @@ WEB_SESSIONS = {}
 SESSION_UIDS = {}
 UNLOCK_SOURCE_EMAIL = os.environ.get("UNLOCK_SOURCE_EMAIL", "").strip()
 UNLOCK_SOURCE_PASSWORD = os.environ.get("UNLOCK_SOURCE_PASSWORD", "")
+CPM_PROXY_SECRET = os.environ.get("CPM_SECRET", "").strip()
 
 # Original feature map, without Telegram callback IDs.
 FEATURES = {
@@ -1971,7 +2047,7 @@ async def health(request):
             "houses", "levels", "unlock_all",
             "change_email", "change_password",
             "delete_friends", "fix_account",
-            "clone_account", "unlock_cars", "delete_account"
+            "clone_account", "inject_car", "delete_account"
         ]
     })
 
@@ -2160,8 +2236,8 @@ async def operation(request):
         return await fix_account(request)
     if op == "clone_account":
         return await clone_account(request)
-    if op == "unlock_cars":
-        return await unlock_cars(request)
+    if op == "inject_car":
+        return await inject_car(request)
     if op == "delete_account":
         return await delete_account(request)
 
@@ -2353,54 +2429,50 @@ async def clone_account(request):
         log.exception("Clone account failed")
         return response({"ok": False, "message": f"{type(e).__name__}: {e}"}, 500)
 
-async def unlock_cars(request):
+async def inject_car(request):
+    if not CPM_PROXY_SECRET:
+        return response({"ok": False, "message": "SERVER_MISSING_PROXY_SECRET"}, 500)
+    provided_secret = str(request.headers.get("X-Proxy-Secret", ""))
+    if not secrets.compare_digest(provided_secret, CPM_PROXY_SECRET):
+        return response({"ok": False, "message": "INVALID_PROXY_SECRET"}, 401)
     try:
         body = await request.json()
+        car_id = int(body.get("car_id"))
+    except (TypeError, ValueError):
+        return response({"ok": False, "message": "INVALID_CAR_ID"}, 400)
     except Exception:
         return response({"ok": False, "message": "INVALID_JSON"}, 400)
 
     uid = session_uid(body)
     if uid is None:
         return response({"ok": False, "message": "INVALID_SESSION"}, 401)
+    if not 0 < car_id <= 100000:
+        return response({"ok": False, "message": "INVALID_CAR_ID"}, 400)
+    if not UNLOCK_SOURCE_EMAIL or not UNLOCK_SOURCE_PASSWORD:
+        return response({"ok": False, "message": "SOURCE_CREDENTIALS_NOT_CONFIGURED"}, 400)
 
-    source_email = str(body.get("source_email", "")).strip() or UNLOCK_SOURCE_EMAIL
-    source_password = str(body.get("source_password", "")) or UNLOCK_SOURCE_PASSWORD
-
-    if not source_email or not source_password:
-        return response({"ok": False, "message": "SOURCE_CREDENTIALS_REQUIRED"}, 400)
-
-    td = nuker.get_token_data(uid) or {}
-    target_token = td.get("auth_token", "")
-    target_uid = td.get("firebase_uid", "")
-
+    target_data = nuker.get_token_data(uid) or {}
+    target_token = str(target_data.get("auth_token", ""))
+    target_uid = str(target_data.get("firebase_uid", ""))
     if not target_token or not target_uid:
         return response({"ok": False, "message": "TARGET_AUTH_UNAVAILABLE"}, 400)
 
     source_token, source_uid = await asyncio.to_thread(
-        verify_user, source_email, source_password
+        verify_user, UNLOCK_SOURCE_EMAIL, UNLOCK_SOURCE_PASSWORD
     )
-
     if not source_token or not source_uid:
         return response({"ok": False, "message": "SOURCE_LOGIN_FAILED"}, 400)
-
-    if str(source_uid) == str(target_uid):
+    if str(source_uid) == target_uid:
         return response({"ok": False, "message": "SOURCE_AND_TARGET_ARE_SAME_ACCOUNT"}, 400)
 
-    report = await cpm1_clone_all_cars_strict(
-        source_token,
-        target_token,
-        target_uid,
-        max_retries=3,
-        retry_delay=1.0,
-        progress_message=None
-    )
-
-    return response({
-        "ok": bool(report.get("complete")),
-        "message": "UNLOCK_CARS_COMPLETE" if report.get("complete") else "UNLOCK_CARS_PARTIAL",
-        "report": report
-    }, 200 if report.get("complete") else 400)
-
+    try:
+        result = await asyncio.to_thread(
+            cpm1_inject_car_from_source, source_token, target_token, target_uid, car_id
+        )
+    except Exception as exc:
+        log.exception("Custom car injection failed")
+        return response({"ok": False, "message": f"CAR_INJECTION_ERROR:{type(exc).__name__}"}, 500)
+    return response(result, 200 if result.get("ok") else 400)
 @web.middleware
 async def cors(request, handler):
     if request.method == "OPTIONS":
