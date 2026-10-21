@@ -1833,11 +1833,31 @@ def cpm1_get_injection_slot(token):
 
 
 def cpm1_inject_car_from_source(source_token, target_token, target_uid, requested_car_id):
-    """Inject one requested model using the highest-ID source car as its template.
+    """Inject one requested model and verify it appears in the target garage.
 
     The source car's native appearance and tuning fields stay intact. Only the
-    model ID and, when present, the matching vinyl model ID are changed.
+    model ID and, when present, the matching vinyl model ID are changed. A
+    successful WSPurchaseCarV3 reply alone is not proof of injection.
     """
+    requested_car_id = int(requested_car_id)
+    target_cars_before = cpm1_get_cars(target_token)
+    if target_cars_before is None:
+        return {"ok": False, "message": "TARGET_GARAGE_READ_FAILED"}
+
+    def count_requested_model(cars):
+        count = 0
+        for item in cars or []:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("CarID", item.get("carID"))
+            try:
+                if int(value or 0) == requested_car_id:
+                    count += 1
+            except (TypeError, ValueError):
+                continue
+        return count
+
+    before_count = count_requested_model(target_cars_before)
     source_cars = cpm1_get_cars(source_token) or []
     source_cars = [car for car in source_cars if isinstance(car, dict)]
     if not source_cars:
@@ -1850,15 +1870,15 @@ def cpm1_inject_car_from_source(source_token, target_token, target_uid, requeste
             return 0
 
     car = deepcopy(max(source_cars, key=source_car_id))
-    car["CarID"] = int(requested_car_id)
+    car["CarID"] = requested_car_id
     if isinstance(car.get("Vynils"), dict):
-        car["Vynils"]["CarID"] = int(requested_car_id)
+        car["Vynils"]["CarID"] = requested_car_id
 
     slot = cpm1_get_injection_slot(target_token)
     if not slot:
         return {"ok": False, "message": "TARGET_GARAGE_SLOT_UNAVAILABLE"}
 
-    vinyl = car.get("Vynils") if isinstance(car.get("Vynils"), dict) else {"CarID": int(requested_car_id)}
+    vinyl = car.get("Vynils") if isinstance(car.get("Vynils"), dict) else {"CarID": requested_car_id}
     payload = {
         "ownerID": slot.get("ownerID", ""),
         "ownerName": slot.get("ownerName", ""),
@@ -1885,7 +1905,26 @@ def cpm1_inject_car_from_source(source_token, target_token, target_uid, requeste
         accepted = False
     if not accepted:
         return {"ok": False, "message": "CAR_INJECTION_FAILED"}
-    return {"ok": True, "message": "CUSTOM_CAR_INJECTED", "car_id": int(requested_car_id)}
+
+    # The game can acknowledge the request before its garage list is updated.
+    # Poll the target, but never repeat the purchase request.
+    for _ in range(12):
+        time.sleep(1)
+        target_cars_after = cpm1_get_cars(target_token)
+        if target_cars_after is not None and count_requested_model(target_cars_after) > before_count:
+            return {
+                "ok": True,
+                "message": "CUSTOM_CAR_INJECTED",
+                "car_id": requested_car_id,
+                "verified": True,
+            }
+
+    return {
+        "ok": False,
+        "message": "SERVER_ACCEPTED_BUT_CAR_NOT_FOUND_IN_TARGET_GARAGE",
+        "car_id": requested_car_id,
+        "server_accepted": True,
+    }
 
 def _car_key(car):
     if not isinstance(car, dict):
