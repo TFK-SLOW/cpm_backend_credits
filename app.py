@@ -1833,12 +1833,7 @@ def cpm1_get_injection_slot(token):
 
 
 def cpm1_inject_car_from_source(source_token, target_token, target_uid, requested_car_id):
-    """Inject one requested model and verify it appears in the target garage.
-
-    The source car's native appearance and tuning fields stay intact. Only the
-    model ID and, when present, the matching vinyl model ID are changed. A
-    successful WSPurchaseCarV3 reply alone is not proof of injection.
-    """
+    """Inject one requested model, report the game API reply, then verify the garage."""
     requested_car_id = int(requested_car_id)
     target_cars_before = cpm1_get_cars(target_token)
     if target_cars_before is None:
@@ -1898,13 +1893,30 @@ def cpm1_inject_car_from_source(source_token, target_token, target_uid, requeste
         "disliked": False,
         "mode": 1,
     }
-    status, text = cpm1_api(target_token, "WSPurchaseCarV3", json.dumps(payload))
+    status, response_text = cpm1_api(target_token, "WSPurchaseCarV3", json.dumps(payload))
     try:
-        accepted = status == 200 and str(json.loads(text).get("result")) == "1"
-    except (ValueError, TypeError, AttributeError):
-        accepted = False
+        server_payload = json.loads(response_text)
+    except (TypeError, ValueError):
+        server_payload = None
+
+    server_result = server_payload.get("result") if isinstance(server_payload, dict) else None
+    server_message = None
+    if isinstance(server_payload, dict):
+        server_message = server_payload.get("message") or server_payload.get("error")
+    server_debug = {
+        "server_http_status": status,
+        "server_result": server_result,
+        "server_message": server_message,
+        "server_response_preview": str(response_text)[:1200],
+    }
+    accepted = status == 200 and str(server_result) == "1"
     if not accepted:
-        return {"ok": False, "message": "CAR_INJECTION_FAILED"}
+        return {
+            "ok": False,
+            "message": "CAR_INJECTION_FAILED",
+            "garage_verified": False,
+            **server_debug,
+        }
 
     # The game can acknowledge the request before its garage list is updated.
     # Poll the target, but never repeat the purchase request.
@@ -1916,14 +1928,16 @@ def cpm1_inject_car_from_source(source_token, target_token, target_uid, requeste
                 "ok": True,
                 "message": "CUSTOM_CAR_INJECTED",
                 "car_id": requested_car_id,
-                "verified": True,
+                "garage_verified": True,
+                **server_debug,
             }
 
     return {
         "ok": False,
         "message": "SERVER_ACCEPTED_BUT_CAR_NOT_FOUND_IN_TARGET_GARAGE",
         "car_id": requested_car_id,
-        "server_accepted": True,
+        "garage_verified": False,
+        **server_debug,
     }
 
 def _car_key(car):
@@ -2491,17 +2505,26 @@ async def inject_car(request):
         return response({"ok": False, "message": "SOURCE_CREDENTIALS_NOT_CONFIGURED"}, 400)
 
     target_data = nuker.get_token_data(uid) or {}
-    target_token = str(target_data.get("auth_token", ""))
-    target_uid = str(target_data.get("firebase_uid", ""))
+    target_email = str(target_data.get("email", "")).strip()
+    target_password = str(target_data.get("password", ""))
+    saved_target_uid = str(target_data.get("firebase_uid", "")).strip()
+    if not target_email or not target_password:
+        return response({"ok": False, "message": "TARGET_SESSION_CREDENTIALS_UNAVAILABLE"}, 400)
+
+    target_token, target_uid = await asyncio.to_thread(
+        verify_user, target_email, target_password
+    )
     if not target_token or not target_uid:
-        return response({"ok": False, "message": "TARGET_AUTH_UNAVAILABLE"}, 400)
+        return response({"ok": False, "message": "TARGET_LOGIN_FAILED"}, 400)
+    if saved_target_uid and str(target_uid) != saved_target_uid:
+        return response({"ok": False, "message": "TARGET_SESSION_ACCOUNT_MISMATCH"}, 400)
 
     source_token, source_uid = await asyncio.to_thread(
         verify_user, UNLOCK_SOURCE_EMAIL, UNLOCK_SOURCE_PASSWORD
     )
     if not source_token or not source_uid:
         return response({"ok": False, "message": "SOURCE_LOGIN_FAILED"}, 400)
-    if str(source_uid) == target_uid:
+    if str(source_uid) == str(target_uid):
         return response({"ok": False, "message": "SOURCE_AND_TARGET_ARE_SAME_ACCOUNT"}, 400)
 
     try:
